@@ -3,3 +3,7 @@ opfunu
 grpcio-tools
 protobuf
 setuptools<81
+tsplib95
+grpcio
+grpcio_tools
+deap

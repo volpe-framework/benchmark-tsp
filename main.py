@@ -1,215 +1,150 @@
-from typing import Any
-from typing_extensions import override
-
-import volpe_py as volpe
-import grpc
-import concurrent.futures
+import struct
 import threading
+import concurrent.futures
+from array import array
+from typing import override
 
-from opfunu.cec_based.cec2022 import *
+import grpc
+import tsplib95 as tsplib
+from deap import base, creator, tools, algorithms
+import random
 
-NDIM=20
+# Protobuf imports
+import volpe_py as volpe
 
-func = F72022(ndim=NDIM)
-
-LOW = func.lb[0]
-HIGH = func.ub[0]
-MUTATE_STD = 5.0
-MUTATION_RATE = 0.5
-INDPB = 1/NDIM
+# --- TSP Setup ---
+problem = tsplib.load_problem('gil262.tsp')
+NDIM = 262
+BASE_POPULATION_SIZE = 100
+LAMBDA_SIZE = BASE_POPULATION_SIZE*7
 CXPROB = 0.5
+MUTATION_RATE = 0.2
 
-BASE_POPULATION_SIZE = 50
+# --- DEAP Configuration ---
+creator.create("FitnessMin", base.Fitness, weights=(-1.0,))
+creator.create("Individual", array, fitness=creator.FitnessMin, typecode='i')
 
-import numpy as np
+toolbox = base.Toolbox()
 
-def fitness(x):
-    return float(np.float32(func.evaluate(x)))
+toolbox.register('indices', random.sample, range(NDIM), NDIM)
+toolbox.register("individual", tools.initIterate, creator.Individual, toolbox.indices)
+toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 
-def mutate(x):
-    mutated = x[0] + np.random.normal(size=NDIM, scale=MUTATE_STD) * \
-            np.array([ 1 if np.random.random() < INDPB else 0 ])
-    for i in range(NDIM):
-        if mutated[i] < LOW:
-            mutated[i] = LOW
-        elif mutated[i] > HIGH:
-            mutated[i] = HIGH
-    if len(mutated) != NDIM:
-        print("ERROR: mutate failed")
-    ind = np.astype(mutated, np.float32)
-    return (ind, fitness(ind))
-def varAnd(popln):
-    ogLen = len(popln)
-    popln = select(popln, ogLen)
-    newpopln = []
-    for i in range(0, ogLen, 2):
-        if np.random.random() < CXPROB:
-            i1 = i
-            i2 = i+1
-            n1, n2 = crossover(popln[i1], popln[i2])
-            newpopln.append(n1)
-            newpopln.append(n2)
-        else:
-            newpopln.append(popln[i])
-            newpopln.append(popln[i+1])
-    return mutate_popln(newpopln)
+def evaluate_tsp(individual):
+    # Convert array back to list for tsplib if necessary
+    return (problem.trace_tours([[i+1 for i in individual]])[0],)
 
-def crossover(x, y):
-    rands = np.random.uniform(0, 1, size=NDIM)
-    ind1 = np.array([x[0][i] if rands[i] < INDPB else y[0][i] for i in range(NDIM)])
-    ind2 = np.array([y[0][i] if rands[i] < INDPB else x[0][i] for i in range(NDIM)])
-    return (ind1, fitness(ind1)), (ind2, fitness(ind2))
+toolbox.register("evaluate", evaluate_tsp)
+toolbox.register("mate", tools.cxOrdered)
+toolbox.register("mutate", tools.mutShuffleIndexes, indpb=0.05)
+toolbox.register("select", tools.selTournament, tournsize=3)
 
-def select(popln: list[tuple[np.ndarray, float]], newPop: int):
-    newpopln = []
-    while len(newpopln) < newPop:
-        choices = [popln[choice(popln)] for _ in range(3)]
-        selected = min(choices, key=lambda x: x[1])
-        newpopln.append((selected[0].copy(), selected[1]))
-    return newpopln
+# --- Serialization Utilities ---
+# 'i' is signed 4-byte integer.
+STRUCT_FORMAT = f">{NDIM}i"
 
-def choice(popln: list[Any]):
-    l = len(popln)
-    idx = np.random.randint(0, l)
-    return idx
+def ind_to_bytes(individual: array) -> bytes:
+    """Converts array-based individual to bytes."""
+    return struct.pack(STRUCT_FORMAT, *individual)
 
-def gen_ind():
-    ind = (np.random.random(size=NDIM) * (HIGH-LOW) + LOW).astype(np.float32)
-    return (ind, fitness(ind))
+def bytes_to_ind(data: bytes):
+    """Converts bytes back to a DEAP array Individual."""
+    indices = struct.unpack(STRUCT_FORMAT, data)
+    return creator.Individual(indices)
 
-def expand(popln: list[tuple[np.ndarray, float]], newPop: int):
-    if len(popln) == 0:
-        return [ gen_ind() for _ in range(newPop) ]
-    if len(popln) >= newPop:
-        return popln
-    while len(popln) < newPop:
-        x1 = popln[choice(popln)]
-        x2 = popln[choice(popln)]
-        y1, y2 = crossover(x1, x2)
-        popln.append(y1)
-        popln.append(y2)
-    return popln
-
-def get_random_list(popln: list[tuple[np.ndarray, float]], n: int):
-    return [ popln[np.random.randint(len(popln))] for _ in range(n) ]
-
-def mutate_popln(popln: list[tuple[np.ndarray, float]]):
-    for i in range(len(popln)):
-        if np.random.random() < MUTATION_RATE:
-            popln[i] = mutate(popln[i])
-    return popln
-
-def popListTostring(popln: list[tuple[np.ndarray, float]]):
-    indList : list[volpe.ResultIndividual] = []
-    for mem in popln:
-        indList.append(
-                volpe.ResultIndividual(representation=np.array_str(mem[0]), 
-                                    fitness=mem[1])
-                )
-    return volpe.ResultPopulation(members=indList)
-
-def bstringToPopln(popln: volpe.Population):
-    popList = []
-    for memb in popln.members:
-        popList.append((np.frombuffer(memb.genotype, dtype=np.float32), memb.fitness))
-    return popList
-
-def adjustSize(popln: list[tuple[np.ndarray, float]], targetSize: int):
-    print("ADJUSTSIZE called unexpectedly")
-    if len(popln) < targetSize:
-        return expand(popln, targetSize)
-    else:
-        return select(popln, targetSize)
-
-def popListToBytes(popln: list[tuple[np.ndarray, float]]):
-    indList : list[volpe.Individual] = []
-    for mem in popln:
-        indList.append(volpe.Individual(genotype=mem[0].astype(np.float32).tobytes(), fitness=mem[1]))
-    return volpe.Population(members=indList, problemID="p1")
-
+# --- Servicer Implementation ---
 class VolpeGreeterServicer(volpe.VolpeContainerServicer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.popln : list[tuple[np.ndarray, float]] = [ gen_ind() for _ in range(BASE_POPULATION_SIZE)  ]
+    def __init__(self):
+        # Evaluate initial population
+        print("INITIALIZED TSP")
+        self.popln = toolbox.population(n=BASE_POPULATION_SIZE)
+        for ind in self.popln:
+            ind.fitness.values = toolbox.evaluate(ind)
         self.poplock = threading.Lock()
+        self.last_best = float('inf')
 
     @override
-    def SayHello(self, request: volpe.HelloRequest, context: grpc.ServicerContext):
-        return volpe.HelloReply(message="hello " + request.name)
-    @override
-    def InitFromSeed(self, request: volpe.Seed, context: grpc.ServicerContext):
-        """Missing associated documentation comment in .proto file."""
+    def InitFromSeed(self, request, context):
         with self.poplock:
-            self.popln = [ gen_ind() for _ in range(BASE_POPULATION_SIZE)  ]
+            self.popln = toolbox.population(n=BASE_POPULATION_SIZE)
+            for ind in self.popln:
+                ind.fitness.values = toolbox.evaluate(ind)
             return volpe.Reply(success=True)
+
     @override
-    def InitFromSeedPopulation(self, request: volpe.Population, context: grpc.ServicerContext):
-        """Missing associated documentation comment in .proto file."""
+    def InitFromSeedPopulation(self, request: pbc.Population, context):
         with self.poplock:
-            ogLen = len(self.popln)
-            seedPop = bstringToPopln(request)
-            if self.popln == None:
-                self.popln = []
-            self.popln.extend(seedPop)
-
-            self.popln = select(self.popln, ogLen)
-
+            indices = random.sample(range(len(self.popln)), len(request.members))
+            for memb, idx in zip(request.members, indices):
+                new_ind = bytes_to_ind(memb.genotype)
+                new_ind.fitness.values = (memb.fitness,)
+                self.popln[idx] = new_ind
             return volpe.Reply(success=True)
+
     @override
     def GetBestPopulation(self, request: volpe.PopulationSize, context):
-        """Missing associated documentation comment in .proto file."""
         with self.poplock:
-            if self.popln is None:
-                return volpe.Population(members=[], problemID="p1")
-            popSorted = sorted(self.popln, key=lambda x: x[1])
-            return popListToBytes(popSorted[:request.size])
-    @override
-    def GetResults(self, request: volpe.PopulationSize, context):
-        with self.poplock:
-            if self.popln is None:
-                return volpe.Population(members=[], problemID="p1")
-            popSorted = sorted(self.popln, key=lambda x: x[1])
-            return popListTostring(popSorted[:request.size])
+            best_inds = tools.selBest(self.popln, request.size)
+            members = [
+                pbc.Individual(
+                    genotype=ind_to_bytes(ind), 
+                    fitness=ind.fitness.values[0]
+                ) for ind in best_inds
+            ]
+            return pbc.Population(members=members)
+
     @override
     def GetRandom(self, request: volpe.PopulationSize, context):
         with self.poplock:
-            if self.popln is None:
-                return volpe.Population(members=[], problemID="p1")
-            popList = get_random_list(self.popln, request.size)
-            return popListToBytes(popList)
+            rand_inds = tools.selRandom(self.popln, request.size)
+            members = [
+                pbc.Individual(
+                    genotype=ind_to_bytes(ind),
+                    fitness=ind.fitness.values[0]
+                ) for ind in rand_inds
+            ]
+            return pbc.Population(members=members)
+
     @override
-    def AdjustPopulationSize(self, request: volpe.PopulationSize, context: grpc.ServicerContext):
-        """Missing associated documentation comment in .proto file."""
-        # context.abort(grpc.StatusCode.CANCELLED, "AdjustPopulationSize not allowed")
-        # targetSize = request.size
-        # # TODO: adjust to targetSize
-        # with self.poplock:
-        #     self.popln = adjustSize(self.popln, BASE_POPULATION_SIZE)
-        #     return volpe.Reply(success=True)
+    def GetResults(self, request: volpe.PopulationSize, context: grpc.ServicerContext):
+        with self.poplock:
+            if not self.popln:
+                return volpe.ResultPopulation(members=[])
+            top_n = tools.selBest(self.popln, k=request.size)
+            
+            indList: list[volpe.ResultIndividual] = []
+            for mem in top_n:
+                # Convert the array.array/DEAP individual to a clean list for string output
+                route_str = str(list(mem))
+                
+                indList.append(
+                    volpe.ResultIndividual(
+                        representation=route_str,
+                        fitness=mem.fitness.values[0]
+                    )
+                )
+            
+            return volpe.ResultPopulation(members=indList)
+
     @override
     def RunForGenerations(self, request: volpe.PopulationSize, context):
-        """Missing associated documentation comment in .proto file."""
         with self.poplock:
-            for _ in range(request.size):
-                ogLen = len(self.popln)
-                popln = select(self.popln, ogLen)
-                newpopln = [ ]
-                for i in range(0, ogLen, 2):
-                    if np.random.random() < CXPROB:
-                        i1 = i
-                        i2 = i+1
-                        n1, n2 = crossover(popln[i1], popln[i2])
-                        newpopln.append(n1)
-                        newpopln.append(n2)
-                    else:
-                        newpopln.append(popln[i])
-                        newpopln.append(popln[i+1])
-                self.popln = mutate_popln(newpopln)
-                self.popln = expand(self.popln, ogLen*2)
-                self.popln = select(self.popln, ogLen)
-        return volpe.Reply(success=True)
+            self.popln, logbook = algorithms.eaMuPlusLambda(
+                population=self.popln,
+                toolbox=toolbox,
+                mu=BASE_POPULATION_SIZE,
+                lambda_= LAMBDA_SIZE,
+                cxpb=CXPROB,
+                mutpb=MUTATION_RATE,
+                ngen=request.size,
+                verbose=False
+            )
+            current_best = tools.selBest(self.popln, 1)[0].fitness.values[0]
+            self.last_best = current_best
+            
+            return volpe.Reply(success=True)
 
-if __name__=='__main__':
+if __name__ == '__main__':
     server = grpc.server(concurrent.futures.ThreadPoolExecutor(max_workers=10))
     volpe.add_VolpeContainerServicer_to_server(VolpeGreeterServicer(), server)
     server.add_insecure_port("0.0.0.0:8081")
